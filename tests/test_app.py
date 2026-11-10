@@ -1,19 +1,18 @@
 import json
+from pathlib import Path
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from app import llm
 from app.analyzer import InvalidModelOutput, analyze, clean_text
 from app.main import app
+from app.schema import FeedbackAnalysis
 
-GOOD = {
-    "sentiment": "Negative", "urgency": "Medium", "category": "Digital Banking",
-    "key_issues": ["App crash"], "recommended_action": "Open a bug ticket.",
-    "suggested_team": "Tech", "escalate_to_human": False, "confidence": 0.9,
-    "reasoning_summary": "App fault.",
-}
+DASHBOARD = str(Path(__file__).resolve().parent.parent / "dashboard.py")
+GOOD = {"sentiment": "Negative", "urgency": "High", "recommended_action": "Block the card.", "confidence": 0.9}
 
 
 def reply(**overrides) -> str:
@@ -31,8 +30,29 @@ def fake(*replies):
     return call
 
 
+# ---- Pydantic schema
+def test_schema_accepts_valid():
+    assert FeedbackAnalysis(**GOOD).urgency == "High"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [{"sentiment": "Angry"}, {"urgency": "Critical"}, {"confidence": 1.5}, {"confidence": -1},
+     {"recommended_action": ""}, {"confidence": "high"}],
+)
+def test_schema_rejects_invalid(bad):
+    with pytest.raises(ValidationError):
+        FeedbackAnalysis(**{**GOOD, **bad})
+
+
+def test_schema_rejects_missing_field():
+    with pytest.raises(ValidationError):
+        FeedbackAnalysis(sentiment="Positive", urgency="Low", confidence=0.9)
+
+
+# ---- analyzer: validation + retry
 def test_valid_reply():
-    assert analyze("The app crashes", call=fake(reply())).urgency == "Medium"
+    assert analyze("My card was stolen", call=fake(reply())).urgency == "High"
 
 
 def test_fenced_json_accepted():
@@ -50,16 +70,12 @@ def test_two_invalid_replies_raise():
         analyze("hi", call=fake("nope", '{"sentiment": "Great"}'))
 
 
-def test_low_confidence_escalates():
-    assert analyze("hi", call=fake(reply(confidence=0.5))).escalate_to_human is True
-
-
 def test_empty_text_rejected():
     with pytest.raises(ValueError):
         analyze("   ", call=fake())
 
 
-def test_pii_masked_before_sending():
+def test_private_data_masked_before_sending():
     call = fake(reply())
     analyze("Mail a.b@x.com, call 9876543210, card 4111 1111 1111 1111, acct 123456789012", call=call)
     sent = json.dumps(call.calls[0][-1])
@@ -77,7 +93,7 @@ client = TestClient(app)
 
 def test_api_returns_json(monkeypatch):
     monkeypatch.setattr(llm, "call_llm", lambda messages: reply())
-    r = client.post("/analyze", json={"text": "My app keeps crashing"})
+    r = client.post("/analyze", json={"text": "My card was stolen"})
     assert r.status_code == 200 and r.json() == GOOD
 
 
@@ -145,3 +161,27 @@ def test_call_llm_bad_key_not_retried(monkeypatch):
     with pytest.raises(llm.LLMConfigError):
         llm.call_llm([], client=http(handler))
     assert n["c"] == 1
+
+
+# ---- Streamlit dashboard (headless)
+def test_dashboard(monkeypatch):
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.setattr(llm, "call_llm", lambda messages: reply())
+    at = AppTest.from_file(DASHBOARD, default_timeout=60).run()
+    assert not at.exception
+    at.text_area[0].set_value("My card was stolen, block it").run()
+    at.button[0].click().run()
+    assert not at.exception and not at.error
+    assert [(m.label, m.value) for m in at.metric] == [("Sentiment", "Negative"), ("Urgency", "High"), ("Confidence", "90%")]
+    assert any(s.value == "Dashboard" for s in at.subheader)
+
+
+def test_dashboard_shows_error_without_key(monkeypatch):
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    at = AppTest.from_file(DASHBOARD, default_timeout=60).run()
+    at.text_area[0].set_value("hello").run()
+    at.button[0].click().run()
+    assert not at.exception and "OPENAI_API_KEY" in at.error[0].value

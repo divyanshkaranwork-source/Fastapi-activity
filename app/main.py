@@ -27,7 +27,7 @@ def health():
 @app.post("/analyze", response_model=FeedbackAnalysis)
 def analyze_feedback(body: AnalyzeRequest):
     try:
-        return analyze(body.text, call=llm.call_llm)
+        return analyze(body.text)
     except InvalidModelOutput as exc:
         raise HTTPException(502, f"Model returned invalid output: {exc}") from None
     except ValueError as exc:

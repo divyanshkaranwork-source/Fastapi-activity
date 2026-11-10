@@ -3,12 +3,11 @@ import re
 
 from pydantic import ValidationError
 
-from .llm import call_llm
+from . import llm
 from .prompts import build_messages
 from .schema import FeedbackAnalysis
 
 MAX_CHARS = 4000
-CONFIDENCE_THRESHOLD = 0.7
 
 
 class InvalidModelOutput(Exception):
@@ -16,7 +15,7 @@ class InvalidModelOutput(Exception):
 
 
 def clean_text(text: str) -> str:
-    """Tidy whitespace, mask basic PII, and cap the length before sending to the LLM."""
+    """Tidy whitespace, mask basic private data, and cap the length before sending to the LLM."""
     text = re.sub(r"</?customer_feedback>", " ", text, flags=re.I)  # no forged prompt tags
     text = re.sub(r"[\w.+-]+@[\w-]+(\.[\w-]+)+", "[EMAIL]", text)
     text = re.sub(r"\b(?:\d[ -]?){13,19}\b", "[CARD_NUMBER]", text)
@@ -26,6 +25,7 @@ def clean_text(text: str) -> str:
 
 
 def parse(reply: str) -> FeedbackAnalysis:
+    """Schema validation: JSON text -> FeedbackAnalysis, or ValueError with a readable reason."""
     reply = re.sub(r"^```(?:json)?|```$", "", reply.strip()).strip()
     try:
         return FeedbackAnalysis.model_validate(json.loads(reply))
@@ -33,14 +33,15 @@ def parse(reply: str) -> FeedbackAnalysis:
         raise ValueError(str(exc)[:500]) from None
 
 
-def analyze(text: str, call=call_llm) -> FeedbackAnalysis:
+def analyze(text: str, call=None) -> FeedbackAnalysis:
+    call = call or llm.call_llm
     cleaned = clean_text(text)
     if not cleaned:
         raise ValueError("text is empty")
     messages = build_messages(cleaned)
     reply = call(messages)
     try:
-        result = parse(reply)
+        return parse(reply)
     except ValueError as err:
         # One retry, telling the model what was wrong.
         messages += [
@@ -48,9 +49,6 @@ def analyze(text: str, call=call_llm) -> FeedbackAnalysis:
             {"role": "user", "content": f"That reply was invalid: {err}\nReturn the corrected JSON only."},
         ]
         try:
-            result = parse(call(messages))
+            return parse(call(messages))
         except ValueError as err2:
             raise InvalidModelOutput(str(err2)) from None
-    if result.confidence < CONFIDENCE_THRESHOLD:
-        result.escalate_to_human = True
-    return result
