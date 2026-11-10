@@ -3,7 +3,3 @@ __pycache__/
 .venv/
 .env
 .pytest_cache/
-data/*.db
-data/*.db-*
-evaluation/results/*.json
-.streamlit/secrets.toml
